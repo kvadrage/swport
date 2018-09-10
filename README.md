@@ -24,7 +24,7 @@ the following operations:
 
 Check help for additional details:
 ```
-$ swport help
+$ swport -h
 ```
 
 ## Examples
@@ -42,17 +42,17 @@ swp1s0, swp1s1, ..., swp2, swp3, ...
 ```
 * automatically by prefix, added to port switchdev portname
 ```
-$ swport rename -p "sd" -d "n"
+$ swport rename -su -p "sd" -d "n"
 sdp1n0, sdp1n1, ..., sdp2, sdp3, ...
 ```
 * manually by mapping between port front panel number and desired netdev name
 ```
-$ swport rename -t port-number "1=swp1,2=swp2,3=swp3"
+$ swport rename -su -t port-number -n "1=swp1,2=swp2,3=swp3"
 swp1, swp2, swp3
 ```
 * manually by mapping between port MAC address and desired netdev name
 ```
-$ swport rename -t port-number "11:22:33:44:55:66=swp1"
+$ swport rename -su -t port-mac -m "11:22:33:44:55:66=swp1"
 swp1
 ```
 
