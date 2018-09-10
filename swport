@@ -1,0 +1,401 @@
+#!/usr/bin/python
+
+__version__ = "0.9.2"
+
+'''
+swport - switch port configuration tool
+This tool was made to make it easier managing networking ports on Linux-based
+HW switches running switchdev (Mellanox Spectrum) when systemd and udev are not
+available in the OS.
+
+It works as a wrapper to ip and devlink tools from iproute2 package to support
+the following operations:
+- index switch ports by multiple attributes:
+-- port netdev name (eth1, sp1, swp1, ...)
+-- port front panel number (1, 2, 3, ...)
+-- port switchdev portname (p1, p2, p3s0, ...)
+-- port mac address (11:22:33:44:55:66)
+
+- display aggregate port information
+-- current port netdev name
+-- port front panel number
+-- port switchdev portname
+-- port switchdev SWID
+-- port PCI ID
+-- port MAC address
+-- port split count
+
+- rename switch ports netdev name
+-- automatically by prefix, added to port switchdev portname
+# swport rename -p "sw" -d "s"
+'swp1s0, swp1s1, ..., swp2, swp3, ...'
+-- manually by mapping between port front panel number and desired netdev name
+# swport rename -t port-number "1=swp1,2=swp2,3=swp3"
+swp1, swp2, swp3
+-- manually by mapping between port MAC address and desired netdev name
+# swport rename -t port-number "11:22:33:44:55:66=swp1"
+swp1
+
+- split ports into cable break-outs (2 or 4 split ports)
+# swport split -r -u "1=4,3=4,5=2,32=2"
+swp1s0-3, swp3s0-3, swp5s0-1, swp32s0-1
+-r - autorename flag
+-u - unsplit unused ports
+-p and -d flags for prefix and delimiter can also be specified
+
+- unsplit port
+# swport unsplit -r "1,3,5,32"
+-r - autorename flag
+-p and -d flags for prefix and delimiter can also be specified
+'''
+
+import re
+import time
+import subprocess
+import argparse
+from collections import Counter
+
+IP_LINK_SHOW = "ip -d link show"
+DEVLINK_PORT_SHOW = "devlink port show"
+
+DEVLINK_PORT_SPLIT = "devlink port split {} count {}"
+DEVLINK_PORT_UNSPLIT = "devlink port unsplit {}"
+
+IP_LINK_SET_NAME = "ip link set dev {} name {} {}"
+IP_LINK_SET_DOWN = "ip link set dev {} down"
+IP_LINK_SET_UP = "ip link set dev {} up"
+IP_ADDR_FLUSH = "ip addr flush dev {}"
+IP_LINK_DEL = "ip link del dev {}"
+
+IP_ADDR_ADD = "ip addr add {} dev {}"
+IP6_ADDR_ADD = "ip -6 addr add {} dev {}"
+
+def execute_command(command, print_error=True):
+    try:
+        out = subprocess.check_output(command, shell=True, stderr=subprocess.STDOUT)
+    except (OSError, subprocess.CalledProcessError) as e:
+        if print_error: print('Error: {}'.format(e))
+        return None
+    out_text = out.decode('utf-8')
+    return out_text
+
+def parse_ip_link(line):
+    result = None
+    pattern = r"(?P<name>^\w+(\.\d+)?)(:?@\w+)?:.*link/(:?ether|loopback) (?P<port_mac>([a-fA-F0-9]{2}[:|\-]?){6}).+?(?:portname (?P<port_name>\w+) switchid (?P<port_swid>\w+))?$"
+    m = re.compile(pattern).match(line)
+    if m:
+        result = m.groupdict()
+        pname = result.get('port_name')
+        if pname:
+            result.update(re.match(r"^p(?P<port_no>\d+).*", pname).groupdict())
+            split_match = re.match(r"^p\d+s(?P<split_no>\d)", pname)
+            if split_match:
+                result['port_split'] = split_match.groupdict().get('split_no')
+    return result
+
+def parse_devlink_port_show(line):
+    pattern = r"(?P<port_pci>^pci/\d{4}:\d{2}:\d{2}.\d/\d+):.*netdev (?P<name>\w+)"
+    m = re.compile(pattern).search(line)
+    if m:
+        return m.groupdict()
+    return None
+
+def collect_ports_data():
+    result = None
+    # ip link show
+    output = execute_command(IP_LINK_SHOW)
+    if not output:
+        return None
+    lines = [re.sub('\n','', line) for line in re.split('^\d+: ', output, flags=re.MULTILINE)]
+    data = [parse_ip_link(line.strip()) for line in lines]
+    result = {d.get('name'): d for d in data if d}
+
+    # devlink port show
+    output = execute_command(DEVLINK_PORT_SHOW)
+    lines = output.split('\n')
+    data = [parse_devlink_port_show(line.strip()) for line in lines]
+    ports = {d.get('name'): d for d in data if d}
+    for p in result:
+        result[p].update(ports.get(p, {}))
+    update_split_ports(result)
+    return result
+
+def find_ports(ports_data, pattern):
+    result = []
+    if pattern == 'all':
+        return sorted(ports_data[p] for p in ports_data)
+    for p in ports_data:
+        if p == pattern:
+            return (ports_data[p], )
+        if ports_data[p].get('port_name') == pattern:
+            return (ports_data[p], )
+        if ports_data[p].get('port_no') == pattern:
+            result.append(ports_data[p])
+        if ports_data[p].get('port_mac') == pattern:
+            return (ports_data[p], )
+    return tuple(result)
+
+def run_port_down(port_name):
+    execute_command(IP_LINK_SET_DOWN.format(port_name))
+
+def run_port_split(port_pci_id, count):
+    execute_command(DEVLINK_PORT_SPLIT.format(port_pci_id, count))
+
+def run_port_unsplit(port_pci_id):
+    execute_command(DEVLINK_PORT_UNSPLIT.format(port_pci_id))
+
+def run_port_rename(curr_name, new_name, shutdown=False, bringup=False):
+    if shutdown:
+        run_port_down(curr_name)
+    up = 'up' if bringup else ''
+    execute_command(IP_LINK_SET_NAME.format(curr_name, new_name, up))
+
+def run_port_reset(port_name, shutdown=False):
+    execute_command(IP_ADDR_FLUSH.format(port_name), print_error=False)
+    if port_name == 'lo':
+        execute_command(IP_ADDR_ADD.format('127.0.0.1/8', port_name), print_error=False)
+        execute_command(IP6_ADDR_ADD.format('::1/128', port_name), print_error=False)
+    else:
+        execute_command(IP_LINK_SET_DOWN.format(port_name), print_error=False)
+    execute_command(IP_LINK_DEL.format(port_name), print_error=False)
+    if not shutdown:
+        execute_command(IP_LINK_SET_UP.format(port_name), print_error=False)
+
+def get_split_ports(ports_data):
+    return Counter([ports_data[p].get('port_no') for p in ports_data
+                      if ports_data[p].get('port_split')]).most_common()
+
+def update_split_ports(ports_data):
+    for sp in get_split_ports(ports_data):
+        ports = find_ports(ports_data, sp[0])
+        for port in ports:
+            port['port_split'] = sp[1]
+
+def ports_split(ports_data, split_ports, rename=True, prefix = 'sw', delim='s', unsplit_missing = False):
+    '''
+    ports_data - ports database (dict of dicts)
+    split_ports - list if ports and split number tuples (eg: [(1,4), (2,4), ...])
+    rename - rename new ports after split
+    prefix - rename prefix
+    unsplit_missing - unsplit existing ports, that are not in split_ports anymore
+    '''
+    done = []
+    split_ports = [(k,int(v)) for k,v in split_ports]
+    if unsplit_missing:
+        # unsplit existing unused ports
+        curr_split = get_split_ports(ports_data)
+        if curr_split:
+            to_unsplit = zip(*list(set(curr_split) - set(split_ports)))
+            if to_unsplit:
+                # unsplit existing unused ports and gather new port info
+                ports_unsplit(ports_data, to_unsplit[0], rename=False)
+                ports_data = collect_ports_data()
+
+    for port_no, count in split_ports:
+        ports = find_ports(ports_data, port_no)
+        for port in ports:
+            if not port:
+                continue
+            split = port.get('port_split')
+            if not count in (2,4):
+                print("Error: can't split port into {}".format(count))
+                continue
+            if split:
+                print("Error: Port {} is already split into {}".
+                      format(port_no, port.get('port_split')))
+                continue
+            if not port.get('port_pci'):
+                print("Error: Port {} can't be split".format(port_no))
+                continue
+            run_port_down(port['name'])
+            run_port_split(port['port_pci'], count)
+            done.append(port_no)
+    if rename and done:
+        # standby
+        time.sleep(1)
+        ports_data = collect_ports_data()
+        ports_rename(ports_data, rename_type="prefix", prefix=prefix)
+
+def ports_unsplit(ports_data, unsplit_ports, rename=True, prefix = 'sw'):
+    done = []
+    if unsplit_ports == 'all':
+        # unsplit all ports
+        unsplit_ports = [p[0] for p in get_split_ports(ports_data)]
+    for port_no in unsplit_ports:
+        ports = find_ports(ports_data, port_no)
+        port = ports[0] if ports else None
+        if not port:
+            continue
+        if not port.get('port_split'):
+            print("Error: Port {} is not split".format(port_no))
+            continue
+        if not port.get('port_pci'):
+            print("Error: Port {} can't be unsplit".format(port_no))
+            continue
+        # shutdown all ports in a split group and clear reset count
+        for p in ports:
+            run_port_down(p['name'])
+            p.pop('port_split')
+        # unsplit first port from a split group
+        run_port_unsplit(port['port_pci'])
+        done.append(port_no)
+    if rename and done:
+        # standby
+        time.sleep(1)
+        ports_data = collect_ports_data()
+        ports_rename(ports_data, rename_type="prefix", prefix=prefix)
+
+def ports_rename(ports_data, rename_type='prefix', prefix='sw',
+                 split_delim='s', port_no_names=None, port_mac_names=None,
+                 limit=None, shutdown=False, bringup=False):
+    renamed = []
+    for p in ports_data:
+        port = ports_data[p]
+        pname = port.get('port_name')
+        port_no = port.get('port_no')
+        if limit and not port_no in limit:
+            continue
+        port_split = port.get('port_split', '')
+        delim = split_delim if port_split else ''
+        port_mac = port.get('port_mac')
+        if rename_type in ('prefix', 'all') and prefix and pname:
+            new_name = prefix+pname
+            run_port_rename(p, new_name, shutdown=shutdown, bringup=bringup)
+            renamed.append((pname, new_name))
+        if rename_type in ('port-number', 'all') and port_no_names:
+            port_no_names = dict(port_no_names)
+            new_name = port_no_names.get(port_no)
+            if new_name:
+                new_name = new_name+delim+str(port_split)
+                run_port_rename(p, new_name, shutdown=shutdown, bringup=bringup)
+                renamed.append((pname, new_name))
+        if rename_type in ('port-mac', 'all') and port_mac_names:
+            port_mac_names = dict(port_mac_names)
+            new_name = port_mac_names.get(port_mac)
+            if new_name:
+                run_port_rename(p, new_name, shutdown=shutdown, bringup=bringup)
+                renamed.append((pname, new_name))
+    return renamed
+
+
+def ports_reset(ports_data, reset_ports, skip_ports=None, shutdown=False):
+    if reset_ports == 'all':
+        reset_ports = ports_data.keys()
+    if skip_ports:
+        reset_ports = [p for p in reset_ports if p not in skip_ports]
+    for p in reset_ports:
+        if p not in ports_data:
+            print("Error: Port {} does not exist".format(port_no))
+            continue
+        run_port_reset(p, shutdown)
+
+
+def run_rename_action(args):
+    num_map, mac_map = None, None
+    if args.NUM_MAP:
+        num_map = re.findall(r"(\d+)\s*?=\s*?(\w+)[,; ]?", args.NUM_MAP)
+    if args.MAC_MAP:
+        mac_map = re.findall(r"((?:[a-fA-F0-9]{2}[:|\-]?){6})\s*?=\s*?(\w+)[,; ]?", args.MAC_MAP)
+    ports_data = collect_ports_data()
+    ports_rename(ports_data, rename_type=args.RENAME_TYPE, prefix=args.PREFIX,
+                 split_delim=args.DELIM, port_no_names=num_map,
+                 port_mac_names=mac_map, shutdown=args.SHUTDOWN, bringup=args.BRINGUP)
+
+def run_split_action(args):
+    if not args.split_ports:
+        return
+    split_ports = re.findall(r"(\w+)\s*?=\s*?(\d)[,; ]?", args.split_ports)
+    if not split_ports:
+        return
+    ports_data = collect_ports_data()
+    ports_split(ports_data, split_ports, rename=args.RENAME,
+                prefix=args.PREFIX, delim=args.DELIM,
+                unsplit_missing=args.UNSPLIT)
+
+def run_unsplit_action(args):
+    if not args.unsplit_ports:
+        return
+    if args.unsplit_ports == 'all':
+        unsplit_ports = 'all'
+    else:
+        unsplit_ports = re.findall(r"(\w+)\s*?[,; ]?", args.unsplit_ports)
+    if not unsplit_ports:
+        return
+    ports_data = collect_ports_data()
+    ports_unsplit(ports_data, unsplit_ports, rename=args.RENAME,
+                prefix=args.PREFIX)
+
+def run_show_action(args):
+    ports_data = collect_ports_data()
+    ports = find_ports(ports_data, args.port)
+    for p in ports:
+        print('{}: {}'.format(p.pop('name'), p))
+
+def run_reset_action(args):
+    if not args.reset_ports:
+        return
+    if args.reset_ports == 'all':
+        reset_ports = 'all'
+    else:
+        reset_ports = re.findall(r"(\w+)\s*?[,; ]?", args.reset_ports)
+    if not reset_ports:
+        return
+    if args.skip_ports:
+        skip_ports = re.findall(r"(\w+)\s*?[,; ]?", args.skip_ports)
+    ports_data = collect_ports_data()
+    ports_reset(ports_data, reset_ports, skip_ports=skip_ports, shutdown=args.SHUTDOWN)
+
+def parse_args():
+    parser = argparse.ArgumentParser(prog='swport', description='switch port configuration tool',
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    subparsers = parser.add_subparsers()
+    parser_show = subparsers.add_parser('show', help='Show port details')
+    parser_show.add_argument('port', type=str, help='Port name or physical no')
+
+    parser_rename = subparsers.add_parser('rename', help='Rename interfaces in the system')
+    parser_rename.add_argument('-t', dest='RENAME_TYPE', choices=['prefix', 'port-number', 'port-mac', 'all'],
+                               default='prefix', help='rename type (default: "%(default)s")')
+    parser_rename.add_argument('-s', dest='SHUTDOWN', action='store_true', help='Shutdown ports before rename')
+    parser_rename.add_argument('-u', dest='BRINGUP', action='store_true', help='Bringup ports after rename')
+    parser_rename.add_argument('-p', dest='PREFIX', type=str, default='sw',
+                               help='interface prefix, added before switchdev portname value eg: -p "sw" becomes "swp1,swp2,... (default: "%(default)s")"')
+    parser_rename.add_argument('-d', dest='DELIM', type=str, default='s',
+                               help='name delimiter for splitted ports. eg: -d "s" becomes "swp1n0,swp2n0,..." (default: "%(default)s")')
+    parser_rename.add_argument('-n', dest='NUM_MAP', type=str,
+                               help='physical port number to name maping. eg: "1=swp1,2=swp2,..."')
+    parser_rename.add_argument('-m', dest='MAC_MAP', type=str,
+                               help='port MAC address to name maping. eg: "11:11:11:11:11:11=mgmt0,..."')
+
+    parser_split = subparsers.add_parser('split', help='Split physical ports into break-out ports')
+    parser_split.add_argument('split_ports', type=str, help='list of physical ports to split. eg: "1=4,2=4,3=2"')
+    parser_split.add_argument('-u', dest='UNSPLIT', action='store_true', help='Unsplit missing ports')
+    parser_split.add_argument('-r', dest='RENAME', action='store_true', default=True, help='Prefix-based rename split ports (default: "%(default)s")')
+    parser_split.add_argument('-p', dest='PREFIX', type=str, default='sw',
+                               help='interface prefix (default: "%(default)s")')
+    parser_split.add_argument('-d', dest='DELIM', type=str, default='s',
+                               help='name delimiter for splitted ports. eg: sp1s0 (default: "%(default)s")')
+
+    parser_unsplit = subparsers.add_parser('unsplit', help='Undo port split')
+    parser_unsplit.add_argument('unsplit_ports', type=str, help='list of physical ports to split. eg: "1,2,3..."')
+    parser_unsplit.add_argument('-r', dest='RENAME', action='store_true', default=True, help='Prefix-based rename unsplit ports (default: "%(default)s")')
+    parser_unsplit.add_argument('-p', dest='PREFIX', type=str, default='sw',
+                               help='interface prefix (default: "%(default)s")')
+    parser_unsplit.add_argument('-d', dest='DELIM', type=str, default='s',
+                               help='name delimiter for splitted ports. eg: sp1s0 (default: "%(default)s")')
+
+    parser_reset = subparsers.add_parser('reset', help='Reset ports')
+    parser_reset.add_argument('reset_ports', type=str, help='list of all port names to reset')
+    parser_reset.add_argument('-s', dest='SHUTDOWN', action='store_true', help='Shutdown ports after reset')
+    parser_reset.add_argument('skip_ports', type=str, nargs='?', default="eth0", help='list of ports to skip resetting (default: "%(default)s")')
+
+    parser_show.set_defaults(func=run_show_action)
+    parser_rename.set_defaults(func=run_rename_action)
+    parser_split.set_defaults(func=run_split_action)
+    parser_unsplit.set_defaults(func=run_unsplit_action)
+    parser_reset.set_defaults(func=run_reset_action)
+
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    args.func(args)
