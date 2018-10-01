@@ -1,6 +1,6 @@
 #!/usr/bin/python
 
-__version__ = "0.9.2"
+__version__ = "0.9.3"
 
 '''
 swport - switch port configuration tool
@@ -198,14 +198,14 @@ def ports_split(ports_data, split_ports, rename=True, prefix = 'sw', delim='s', 
                 continue
             split = port.get('port_split')
             if not count in (2,4):
-                print("Error: can't split port into {}".format(count))
+                print("Can't split port {} into {}".format(port_no, count))
                 continue
             if split:
-                print("Error: Port {} is already split into {}".
+                print("Port {} is already split into {}. Skipping...".
                       format(port_no, port.get('port_split')))
                 continue
             if not port.get('port_pci'):
-                print("Error: Port {} can't be split".format(port_no))
+                print("Port {} can't be split".format(port_no))
                 continue
             run_port_down(port['name'])
             run_port_split(port['port_pci'], count)
@@ -368,8 +368,8 @@ def parse_args():
 
     parser_split = subparsers.add_parser('split', help='Split physical ports into break-out ports')
     parser_split.add_argument('split_ports', type=str, help='list of physical ports to split. eg: "1=4,2=4,3=2"')
-    parser_split.add_argument('-u', dest='UNSPLIT', action='store_true', help='Unsplit missing ports')
-    parser_split.add_argument('-r', dest='RENAME', action='store_true', default=True, help='Prefix-based rename split ports (default: "%(default)s")')
+    parser_split.add_argument('-u', dest='UNSPLIT', action='store_true', default=False, help='Unsplit missing ports (default: "%(default)s")')
+    parser_split.add_argument('-r', dest='RENAME', action='store_true', default=False, help='Prefix-based rename split ports (default: "%(default)s")')
     parser_split.add_argument('-p', dest='PREFIX', type=str, default='sw',
                                help='interface prefix (default: "%(default)s")')
     parser_split.add_argument('-d', dest='DELIM', type=str, default='s',
@@ -377,7 +377,7 @@ def parse_args():
 
     parser_unsplit = subparsers.add_parser('unsplit', help='Undo port split')
     parser_unsplit.add_argument('unsplit_ports', type=str, help='list of physical ports to split. eg: "1,2,3..."')
-    parser_unsplit.add_argument('-r', dest='RENAME', action='store_true', default=True, help='Prefix-based rename unsplit ports (default: "%(default)s")')
+    parser_unsplit.add_argument('-r', dest='RENAME', action='store_true', default=False, help='Prefix-based rename unsplit ports (default: "%(default)s")')
     parser_unsplit.add_argument('-p', dest='PREFIX', type=str, default='sw',
                                help='interface prefix (default: "%(default)s")')
     parser_unsplit.add_argument('-d', dest='DELIM', type=str, default='s',
